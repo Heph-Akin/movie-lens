@@ -1,0 +1,447 @@
+---
+title: "Movie Lens"
+author: "Hephzibah Akindele"
+date: '`r Sys.Date()`'
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(stringr)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+# Introduction
+
+The Movie Lens project involves building a recommendation system for the movielens data set provided by the dslabs package in the HarvardX Data Science Capstone Course.
+The actual movie lens data set has millions of ratings but this project will use the 10M version of the dataset for ease of computation.
+
+# The Dataset
+
+The dataset consists of `r dim(edx)[2]` features and `r dim(edx)[1]` entries.
+The features include: `r colnames(edx)`.
+
+1.  `userId`: an integer from 1 to `r format(max(as.integer(edx$userId)), big.mark = ',')` signifies the user who made the rating.
+
+2.  `movieId`: an integer from 1 to `r format(max(as.integer(edx$movieId)), big.mark = ',')` signifies which movie was rated.
+
+3.  `rating`: a multiple of 0.5, from 0.5 to 5.0.
+
+4.  `timestamp`: a `POSIXct` object representing the time at which the rating was made.
+
+5.  `title`: the name of the movie rated, suffixed which the year of release in parentheses.
+
+There is no missing data in the dataset.
+These are the first entries on the dataset:
+
+```{r head, include=TRUE, echo = FALSE}
+head(edx)
+```
+
+There are `r length(unique(edx$userId))` unique User Ids i.e `r length(unique(edx$userId))` different users, and `r length(unique(edx$movieId))` unique movie Ids i.e `r length(unique(edx$movieId))`different movies, 19 different genres: 'Action', 'Adventure', 'Animation', 'Children', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Fantasy', 'Film-Noir', 'Horror', 'IMAX', 'Musical', 'Mystery', 'Romance', 'Sci-Fi', 'Thriller', 'War', 'Western' and entries without genres are indicated by '(no genres listed)'.
+
+# Exploratory Data Analysis
+
+## Genres
+
+A look at the first six entries on the data set shows that there are multiple genre combinations, the following plot shows the highest number of genres combined.
+
+```{r plot1, include=TRUE, echo = FALSE}
+# Genre count is equal to the number of pipe "|" symbols plus one
+# Adding plus one would count one genre for "no genres" so we'll minus one from occurrences of "no genres" to balance out.
+genre_counts <-
+  table(str_count(edx$genres, '\\|') + 1
+        - str_count(edx$genres, 'no genres'))
+par(cex = 0.7)
+barplot(genre_counts, xlab = 'Number of genres', ylab = 'Count', main = 'Genres per movie')
+barplot(genre_counts, xlab = 'Number of genres', ylab = 'Count',
+        main = 'Genres per movie')
+
+# Genre combination count
+genre_combinations <- edx %>%
+  group_by(genres) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+```
+
+The genres feature has `r nrow(genre_combinations) -1` different genre combinations and while analyzing the importance of each of the 19 genres might improve the accuracy of the machine learning model, computational limitations would not allow this project explore that aspect.
+Instead the genre combinations will be analyzed as they are.
+
+## Ratings
+
+The average rating for all movies in the data set is `r mean(edx$ratings)` .
+Analyzing the ratings feature reveals that the most frequently given ratings, the movie with the highest average rating, the users that rated the most movies, the most rated genre combination, the highest rated genre combination.
+etc.
+
+### The Most Frequently Given Ratings
+
+```{r most_freq_rating, include = TRUE, echo = FALSE}
+# Rating count
+rating_count <- edx %>% group_by(rating) %>%
+  mutate(rating = rating) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) 
+
+ggplot(rating_count, mapping = aes(factor(rating), count)) +
+  geom_col(aes(fill = count)) +
+  labs(title = "Frequency of Ratings") +
+  scale_y_continuous(name = "Rating Count",labels = scales::comma) +
+  xlab("Rating") +
+  guides(fill=guide_legend(title="Rating Count"))
+
+```
+
+The table shows the top 3 most given ratings are 4, 3 and 5 respectively.
+
+### The Highest Rated Movies
+
+The table below shows the movies with highest average ratings and the lowest average ratings.
+It looks like the movies closer to the extremes of the rating scale i.e closer to 5 and 0.5, have only a few ratings.
+
+```{r highest_average_rating, include = TRUE, echo = FALSE}
+#Average rating per movie
+average <- edx %>%
+  select(movieId, title, genres, rating) %>%
+  group_by(movieId, title) %>%
+  summarise(average_rating = mean(rating), count = n()) %>%
+  arrange(desc(average_rating))
+
+head(average)
+tail(average)
+```
+
+The scatter plot for the data helps us visualize a trend in the data.
+Movies that have been rated more times seem to have a higher average rating, until it gets closer to 5.
+Intuitively this makes some sense as popular good movies will be seen by more people and get more good ratings increasing the average ratings.
+This trend indicates that there will be some merit in including the frequency of rating per movie as a feature for the modelling process.
+
+```{r average_ratings_scatterplot, include=TRUE, echo=FALSE}
+average %>%
+  ggplot(aes(count, average_rating)) +
+  geom_point() + 
+  geom_smooth(method = lm) +
+  xlab("Number of Ratings per Movie") +
+  ylab("Average Ratings per Movie")
+```
+
+### Ratings Per User
+
+It's impossible for every user to rate every movie, so looking at the number of movies each user rated might give some insights to the users rating behavior.
+
+```{r ratings_per_user, include=TRUE, echo=FALSE}
+average_per_user <- edx %>%
+  group_by(userId) %>%
+  summarise(average_rating = mean(rating), count = n()) %>%
+  arrange(desc(count))
+
+average_per_user %>%
+  ggplot(aes(count, average_rating)) +
+  geom_point(aes()) +
+  geom_smooth(method = lm) +
+  xlab("Number of Ratings per User") +
+  ylab("Average Ratings per User")
+
+```
+
+The scatter plot shows that there's a slight trend, the users average rating decreases as the number of movies a user rates increases.
+Thus the number of movies a user has rated and the users average rating have some predictive value and should be included in the modelling process.
+
+## Timestamp
+
+No significant trends were found when comparing the year each movie was rated to the average ratings for that year, and as such average rating per year would be excluded from the modelling processes.
+
+```{r time, include=TRUE, echo=FALSE}
+date <- edx %>%
+  mutate(date = year(as.POSIXct(timestamp, origin = "1970-01-01"))) %>%
+  group_by(date) %>%
+  summarise(count = n(), average_rating = mean(rating))
+
+date %>%
+  ggplot(aes(date, average_rating)) +
+  geom_point() +
+  #expand_limits(y = 0) +
+  geom_smooth(method = lm) +
+  xlab("Year") +
+  ylab("Average Rating") +
+  theme(axis.text.x = element_text(angle = 90, size = 10)) 
+```
+
+The time feature
+
+# Modelling
+
+## Model Evaluation (RMSE)
+
+The metric for evaluating accuracy of the models in the project will be the Root Mean Square Error:
+
+$$
+\text{RMSE} = \sqrt{\frac{1}{\left|\mathcal{T}\right|}\sum_{(u,i)\in\mathcal{T}} \left(y_{u,i} - \hat{y}_{u,i}\right)^2}
+$$
+
+where $y$ denotes the true values of movie ratings in the test set $\mathcal{T}$ ;
+
+and $\hat{y}$ denotes the estimated values.
+
+```{r RMSE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+The 'edx' data set will be partitioned into a training set and a test set.
+These partitions will be used to evaluate the different models, and different stages of each model.
+
+The validation data set is reserved for evaluating the RMSE of the final model.
+
+## Predicting with the mean
+
+Firstly, we will make predictions with just the mean; to serve as a bench mark for accuracy of the models.
+A model that performs worse than blindly picking the mean rating, is a terrible model.
+This model assumes the variations in the ratings are due to random error.
+
+This is the equation for making predictions based on just the mean:
+
+$$Y_{u,i} \sim \mu + \varepsilon_{u,i}$$
+
+where $Y_{u,i}$ is the prediction,
+
+$\epsilon_{u,i}$ is the independent error, and
+
+$\mu$ the expected "true" rating for all movies.
+
+```{r naive_model, include=FALSE}
+
+# Partitioning edx data into training and test sets
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.2, list = FALSE)
+edx_train <- edx[-test_index,]
+edx_test <- edx[test_index,]
+
+#mean on the training set
+mu <- mean(edx_train$rating)
+
+naive_rmse <- RMSE(edx_test$rating, mu)
+```
+
+Predicting the mean gives the following naive RMSE `r naive_rmse`.
+The smaller the RMSE the more accurate the predictions.
+This RMSE will serve as a benchmark for the predictions we will make with the other models for this project.
+
+## Linear Regression
+
+The exploratory data analysis highlighted some features that have some predictive value like the number of times a movie was rated and the number of times a user rated a movie.
+
+```{r wrangling, include = FALSE}
+
+# Adding columns with insights from the EDA
+
+# Function to get mode 
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# Most frequently given ratings by each user
+mode_user_rating <- edx %>%
+  group_by(userId)%>%
+  summarise(mode_user_rating = getmode(rating))
+
+edx <- left_join(edx, mode_user_rating, by = "userId")
+
+
+# Most frequently given ratings for each movie
+mode_movie_rating <-  edx %>%
+  group_by(movieId) %>%
+  summarise(mode_movie_rating = getmode(rating))
+
+edx <- left_join(edx, mode_movie_rating, by = "movieId")
+
+# Number of ratings the user has given
+rating_count <- edx %>%
+  group_by(userId) %>%
+  summarise(rating_count = n())
+
+edx <- left_join(edx, rating_count, by = "userId")
+# Average rating per user
+average_rating_user <- edx %>%
+  group_by(userId) %>%
+  summarise(average_rating_user = mean(rating)) 
+
+edx <- left_join(edx, average_rating_user, by = "userId")
+
+
+# Average rating per movie
+average_rating_movie <- edx %>%
+  group_by(movieId) %>%
+  summarise(average_rating_movie = mean(rating)) 
+
+edx <- left_join(edx, average_rating_movie, by = "movieId")
+
+
+```
+
+A linear model with just the data in the original data set would have a formula:
+
+$$
+Y = \alpha + \beta_{1}(\operatorname{userId}) + \beta_{2}(\operatorname{movieId}) + \beta_{3}(\operatorname{genres}) + \beta_{4}(\operatorname{timestamp}) + \epsilon
+$$
+
+```{r lm, include=FALSE}
+
+#Encoding Categorical Variables
+edx$title <- unclass(as.factor(edx$title))
+edx$genres <- unclass(as.factor(edx$genres))
+
+
+
+# Partitioning edx data into training and test sets
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.2, list = FALSE)
+edx_train <- edx[-test_index,]
+edx_test <- edx[test_index,]
+
+
+# Linear Regression
+lm <- lm(rating ~ userId+movieId+timestamp+genres, data = edx_train)
+
+lm_pred <- predict(lm, newdata = edx_test)
+
+lm_RMSE <- RMSE(edx_test$rating, lm_pred)
+
+```
+
+and an RMSE of `r lm_RMSE` which is a little less than the Naive RMSE `r naive_rmse` gotten from predicting with the mean.
+
+```{r lm_new, include=FALSE}
+# Linear Regression with insights from the EDA
+lm_new <- lm(rating ~ userId+movieId+genres+mode_user_rating+mode_movie_rating+rating_count+average_rating_user+average_rating_movie, data = edx_train)
+
+#Predictions with the new linear model
+lm_new_pred <- predict(lm_new, newdata = edx_test)
+
+# RMSE of the new linear model
+lm_new_RMSE <- RMSE(edx_test$rating, lm_new_pred)
+```
+
+Adding terms from the exploratory data analysis, would give us this formula:
+
+$$
+Y = \alpha + \beta_{1}(\operatorname{userId})+ \beta_{2}(\operatorname{movieId}) +  \beta_{3}(\operatorname{genres}) + 
+$$
+
+$$
+\beta_{4}(\operatorname{mode\_user\_rating}) + \beta_{5}(\operatorname{mode\_movie\_rating}) + \beta_{6}(\operatorname{rating\_count}) + 
+$$
+
+$$
+\beta_{7}(\operatorname{average\_rating\_user}) + \beta_{8}(\operatorname{average\_rating\_movie}) + \epsilon
+$$
+
+This new model improves the RMSE to `r lm_new_RMSE` , which is a great improvement from the RMSE of the previous linear model (`r lm_RMSE`).
+
+## Conclusion
+
+```{r validation, include=FALSE}
+# Adding EDA Features to validation data set
+# Most frequently given ratings by each user
+validation_mur <- validation %>%
+  group_by(userId)%>%
+  summarise(mode_user_rating = getmode(rating))
+
+validation <- left_join(validation, validation_mur, by = "userId")
+
+
+# Most frequently given ratings for each movie
+validation_mmr <-  validation %>%
+  group_by(movieId) %>%
+  summarise(mode_movie_rating = getmode(rating))
+
+validation <- left_join(validation, validation_mmr, by = "movieId")
+
+# Number of ratings the user has given
+validation_rc <- validation %>%
+  group_by(userId) %>%
+  summarise(rating_count = n())
+
+validation <- left_join(validation, rating_count, by = "userId")
+
+
+# Average rating per user
+validation_aru <- validation %>%
+  group_by(userId) %>%
+  summarise(average_rating_user = mean(rating)) 
+
+validation <- left_join(validation, validation_aru, by = "userId")
+
+
+# Average rating per movie
+validation_arm <- validation %>%
+  group_by(movieId) %>%
+  summarise(average_rating_movie = mean(rating)) 
+
+validation <- left_join(validation, validation_arm, by = "movieId")
+
+#Encoding Categorical Variables for Validation Dataset
+validation$genres <- unclass(as.factor(validation$genres))
+
+
+# Validation of the Final model
+validation_pred <- predict(lm_new, newdata = validation)
+
+validation_RMSE <- RMSE(validation$rating, validation_pred)
+
+```
+
+The aim of this project is to produce a model with an RMSE less than 0.87750 and the final linear model RMSE on the validation set is \``r validation_RMSE`\`.
+The Exploratory Data Analysis proved very helpful as the insights highlighted terms that drastically reduced the RMSE.
+
+Recommendations that could not be done due computational limitations, but would further reduce the RMSE and improve modelling accuracy include:
+
+1.  Creating dummy variables for the genres feature of the edx data set and analyzing them individual instead of in combinations.
+
+2.  Using Random Forest Regression to predict the ratings instead of a multiple linear regression.
